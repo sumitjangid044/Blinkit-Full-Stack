@@ -26,7 +26,11 @@ app.post(
 
 // ⚙️ Middlewares
 app.use(cors({
-    origin: "http://localhost:5173",
+    origin: [
+        "http://localhost:5173",
+        "https://blinkit-full-stack-pq73.vercel.app"
+    ],
+
     credentials: true,
     methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"]
@@ -54,5 +58,6 @@ app.use("/api/order", orderRouter);
 connectDB().then(() => {
     app.listen(PORT, () => {
         console.log(`✅ Server is running on port ${PORT}`);
+        
     });
 });
