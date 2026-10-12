@@ -21,7 +21,6 @@ import addressRouter from './route/address.route.js';
 import orderRouter from './route/order.route.js';
 
 const app = express();
-
 const PORT = process.env.PORT || 8080;
 
 // Allowed frontend URLs
@@ -34,7 +33,7 @@ const allowedOrigins = [
 ];
 
 // CORS configuration
-const corsOptions = {
+app.use(cors({
     origin: function (origin, callback) {
         if (!origin || allowedOrigins.includes(origin)) {
             return callback(null, true);
@@ -46,9 +45,7 @@ const corsOptions = {
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization']
-};
-
-app.use(cors(corsOptions));
+}));
 
 // Stripe webhook must be before express.json()
 app.post(
@@ -72,7 +69,7 @@ app.use(
 app.get('/', (req, res) => {
     res.json({
         success: true,
-        message: `Server running on port ${PORT}`
+        message: 'Blinkit API is running'
     });
 });
 
@@ -86,15 +83,51 @@ app.use('/api/cart', cartRouter);
 app.use('/api/address', addressRouter);
 app.use('/api/order', orderRouter);
 
-// Database connection and server startup
-connectDB()
-    .then(() => {
-        console.log('MongoDB connected successfully');
+// Connect to MongoDB before handling requests.
+// Cache the connection promise to avoid reconnecting unnecessarily.
+let dbConnectionPromise;
 
-        app.listen(PORT, () => {
-            console.log(`Server is running on port ${PORT}`);
+async function ensureDBConnection() {
+    if (!dbConnectionPromise) {
+        dbConnectionPromise = connectDB().catch((error) => {
+            dbConnectionPromise = null;
+            throw error;
         });
-    })
-    .catch((err) => {
-        console.error('Database connection error:', err);
-    });
+    }
+
+    await dbConnectionPromise;
+}
+
+// Local development server
+if (!process.env.VERCEL) {
+    ensureDBConnection()
+        .then(() => {
+            console.log('MongoDB connected successfully');
+
+            app.listen(PORT, () => {
+                console.log(`Server is running on port ${PORT}`);
+            });
+        })
+        .catch((error) => {
+            console.error('Database connection error:', error);
+        });
+}
+
+// Vercel serverless handler
+const vercelHandler = async (req, res) => {
+    try {
+        await ensureDBConnection();
+        return app(req, res);
+    } catch (error) {
+        console.error('Database connection error:', error.message);
+
+        if (!res.headersSent) {
+            return res.status(500).json({
+                success: false,
+                message: 'Database connection failed'
+            });
+        }
+    }
+};
+
+export default vercelHandler;
