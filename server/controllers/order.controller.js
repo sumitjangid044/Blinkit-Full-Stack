@@ -5,263 +5,380 @@ import UserModel from "../models/user.model.js";
 import mongoose from "mongoose";
 import stripe from "../config/stripe.js";
 
-
-
+// ==========================================
+// CASH ON DELIVERY ORDER
+// ==========================================
 export async function CashOnDeliveryOrderController(req, res) {
     try {
-        const userId = req.userId // auth middleware 
-        const { list_items, totalAmt, addressId, subTotalAmt } = req.body
+        const userId = req.userId;
+        const { list_items, totalAmt, addressId, subTotalAmt } = req.body;
 
-        const payload = list_items.map(el => {
-            return ({
-                userId: userId,
-                orderId: `ORD-${new mongoose.Types.ObjectId()}`,
-                productId: el.productId._id,
-                product_details: {
-                    name: el.productId.name,
-                    image: el.productId.image
-                },
-                paymentId: "",
-                payment_status: "CASH ON DELIVERY",
-                delivery_address: addressId,
-                subTotalAmt: subTotalAmt,
-                totalAmt: totalAmt,
-            })
-        })
-        const generatedOrder = await OrderModel.insertMany(payload)
+        if (!userId || !list_items?.length || !addressId) {
+            return res.status(400).json({
+                message: "User, cart items and delivery address are required",
+                success: false,
+                error: true
+            });
+        }
 
-        ///remove from the cart
-        const removeCartItems = await CartProductModel.deleteMany({ userId: userId })
-        const updateInUser = await UserModel.updateOne({ _id: userId }, { shopping_cart: [] })
+        const payload = list_items.map((el) => ({
+            userId,
+            orderId: `ORD-${new mongoose.Types.ObjectId()}`,
+            productId: el.productId._id,
+            product_details: {
+                name: el.productId.name,
+                image: el.productId.image
+            },
+            paymentId: "",
+            payment_status: "CASH ON DELIVERY",
+            delivery_address: addressId,
+            subTotalAmt,
+            totalAmt
+        }));
+
+        const generatedOrder = await OrderModel.insertMany(payload);
+
+        // Clear cart only after order is saved
+        await CartProductModel.deleteMany({ userId });
+        await UserModel.findByIdAndUpdate(userId, {
+            $set: { shopping_cart: [] }
+        });
+
+        console.log("COD order created and cart cleared:", userId);
 
         return res.json({
             message: "Order successfully",
             error: false,
             success: true,
             data: generatedOrder
-        })
-
-
+        });
     } catch (error) {
+        console.error("COD order error:", error);
+
         return res.status(500).json({
-            message: error.message || error,
+            message: error.message || "Failed to create COD order",
             error: true,
             success: false
-        })
+        });
     }
-
 }
 
+// ==========================================
+// PRICE WITH DISCOUNT
+// ==========================================
 export const priceWithDiscount = (price, dis = 1) => {
-    const discountAmount = Math.ceil((Number(price) * Number(dis)) / 100)
-    const actualPrice = Number(price) - Number(discountAmount)
-    return actualPrice
-}
+    const discountAmount = Math.ceil(
+        (Number(price) * Number(dis)) / 100
+    );
 
+    return Number(price) - discountAmount;
+};
+
+// ==========================================
+// CREATE STRIPE CHECKOUT SESSION
+// ==========================================
 export async function paymentController(req, res) {
     try {
-        const userId = req.userId // auth middleware 
-        const { list_items, addressId } = req.body
+        const userId = req.userId;
+        const { list_items, addressId } = req.body;
 
-        const user = await UserModel.findById(userId)
+        if (!userId || !list_items?.length || !addressId) {
+            return res.status(400).json({
+                message: "User, cart items and delivery address are required",
+                success: false,
+                error: true
+            });
+        }
 
-        const line_items = list_items.map(item => {
+        const user = await UserModel.findById(userId);
+
+        if (!user) {
+            return res.status(404).json({
+                message: "User not found",
+                success: false,
+                error: true
+            });
+        }
+
+        const line_items = list_items.map((item) => {
+            const product = item.productId;
+
+            if (!product?._id || !product?.name || !product?.price) {
+                throw new Error("Invalid product details in cart");
+            }
+
+            const price = priceWithDiscount(
+                product.price,
+                product.discount
+            );
+
             return {
                 price_data: {
-                    currency: 'inr',
+                    currency: "inr",
                     product_data: {
-                        name: item.productId.name,
-                        images: item.productId.image,
+                        name: product.name,
+                        images: Array.isArray(product.image)
+                            ? product.image.filter(Boolean).slice(0, 8)
+                            : [],
                         metadata: {
-                            productId: item.productId._id
+                            productId: String(product._id)
                         }
                     },
-                    unit_amount: priceWithDiscount(item.productId.price, item.productId.discount) * 100
+                    unit_amount: Math.round(price * 100)
                 },
                 adjustable_quantity: {
                     enabled: true,
                     minimum: 1
                 },
-                quantity: item.quantity
-            }
-        })
+                quantity: Number(item.quantity) || 1
+            };
+        });
 
-        const params = {
-            submit_type: 'pay',
-            mode: 'payment',
-            payment_method_types: ['card'],
+        const frontendUrl = process.env.FRONTEND_URL?.replace(/\/$/, "");
+
+        if (!frontendUrl) {
+            throw new Error("FRONTEND_URL is missing in environment variables");
+        }
+
+        const session = await stripe.checkout.sessions.create({
+            submit_type: "pay",
+            mode: "payment",
+            payment_method_types: ["card"],
             customer_email: user.email,
             metadata: {
-                userId: userId,
-                addressId: addressId
+                userId: String(userId),
+                addressId: String(addressId)
             },
-            line_items: line_items,
-            success_url: `${process.env.FRONTEND_URL}/success?session_id={CHECKOUT_SESSION_ID}`,
-            cancel_url: `${process.env.FRONTEND_URL}/cancel`
-        }
+            line_items,
+            success_url:
+                `${frontendUrl}/success?session_id={CHECKOUT_SESSION_ID}`,
+            cancel_url: `${frontendUrl}/cancel`
+        });
 
-        const session = await stripe.checkout.sessions.create(params)
-
-        res.status(200).json({ url: session.url });
-
+        return res.status(200).json({
+            url: session.url,
+            success: true,
+            error: false
+        });
     } catch (error) {
+        console.error("Stripe checkout creation error:", error);
+
         return res.status(500).json({
-            message: error.message || error,
+            message: error.message || "Unable to start payment",
             error: true,
             success: false
-        })
+        });
     }
 }
 
-
-const getOrderProductItems = async ({
-    lineItems,
-    userId,
-    addressId,
-    paymentId,
-    payment_status,
-}) => {
-    const productList = []
-
-    if (lineItems?.data?.length) {
-        for (const item of lineItems.data) {
-            const product = await stripe.products.retrieve(item.price.product)
-
-            const payload = {
-                userId: userId,
-                orderId: `ORD-${new mongoose.Types.ObjectId()}`,
-                productId: product.metadata.productId,
-                product_details: {
-                    name: product.name,
-                    image: product.images
-                },
-                paymentId: paymentId,
-                payment_status: payment_status,
-                delivery_address: addressId,
-                subTotalAmt: Number(item.amount_total / 100),
-                totalAmt: Number(item.amount_total / 100),
-            }
-
-            productList.push(payload)
-        }
-    }
-
-    return productList
-}
-
-
+// ==========================================
+// STRIPE WEBHOOK
+// ==========================================
 const endpointSecret = process.env.STRIPE_ENDPOINT_WEBHOOK_SECRET_KEY;
 
-//http://localhost:8080/api/order/webhook
-export const webhookStripe = async (req, res) => {
+export async function webhookStripe(req, res) {
+    let event;
+
     try {
-        console.log("⚡ [1] Stripe webhook route HIT");
+        console.log("Stripe webhook received");
 
-        const sig = req.headers["stripe-signature"];
-        let event;
+        if (!endpointSecret) {
+            console.error("STRIPE_ENDPOINT_WEBHOOK_SECRET_KEY is missing");
 
+            return res.status(500).send("Webhook secret is not configured");
+        }
+
+        const signature = req.headers["stripe-signature"];
+
+        if (!signature) {
+            return res.status(400).send("Missing Stripe signature");
+        }
+
+        // req.body must be the raw Buffer for signature verification
         try {
-            // ✅ Verify Stripe signature
             event = stripe.webhooks.constructEvent(
                 req.body,
-                sig,
+                signature,
                 endpointSecret
             );
-            console.log("✅ [2] Stripe signature verified!");
-        } catch (err) {
-            console.error("❌ [2] Signature verification failed:", err.message);
-            return res.status(400).send(`Webhook Error: ${err.message}`);
+        } catch (error) {
+            console.error("Stripe signature verification failed:", error.message);
+
+            return res.status(400).send(
+                `Webhook Error: ${error.message}`
+            );
         }
 
-        const importantEvents = ["checkout.session.completed"];
-        if (!importantEvents.includes(event.type)) {
-            return res.status(200).send(`Ignored event: ${event.type}`);
+        console.log("Stripe event:", event.type);
+
+        // Ignore other Stripe events
+        if (event.type !== "checkout.session.completed") {
+            return res.status(200).json({
+                received: true,
+                ignored: true
+            });
         }
 
-        console.log("📦 [3] Event type:", event.type);
+        const session = event.data.object;
 
-        if (event.type === "checkout.session.completed") {
-            const session = event.data.object;
-            console.log("💰 [4] Payment successful for session:", session.id);
+        // Do not create orders for unpaid sessions
+        if (session.payment_status !== "paid") {
+            console.log("Checkout session is not paid:", session.id);
 
-            try {
-                // ✅ Fetch all line items for this session
-                const lineItems = await stripe.checkout.sessions.listLineItems(
-                    session.id,
-                    { expand: ["data.price.product"] }
+            return res.status(200).json({
+                received: true,
+                skipped: "Payment not completed"
+            });
+        }
+
+        const userId = session.metadata?.userId;
+        const addressId = session.metadata?.addressId;
+
+        if (
+            !userId ||
+            !addressId ||
+            !mongoose.Types.ObjectId.isValid(userId) ||
+            !mongoose.Types.ObjectId.isValid(addressId)
+        ) {
+            console.error("Missing or invalid checkout metadata", {
+                sessionId: session.id,
+                userId,
+                addressId
+            });
+
+            return res.status(400).send("Missing or invalid checkout metadata");
+        }
+
+        // Check whether this payment has already generated orders.
+        // Every item in the same checkout uses the same payment intent.
+        const paymentId =
+            typeof session.payment_intent === "string"
+                ? session.payment_intent
+                : session.payment_intent?.id;
+
+        if (!paymentId) {
+            return res.status(400).send("Payment intent is missing");
+        }
+
+        const existingOrder = await OrderModel.findOne({
+            userId,
+            paymentId
+        });
+
+        if (existingOrder) {
+            console.log("Orders already created for payment:", paymentId);
+
+            // Retry cart cleanup in case an earlier attempt failed here.
+            await CartProductModel.deleteMany({ userId });
+            await UserModel.findByIdAndUpdate(userId, {
+                $set: { shopping_cart: [] }
+            });
+
+            return res.status(200).json({
+                received: true,
+                message: "Order already exists; cart cleanup completed"
+            });
+        }
+
+        // Retrieve the purchased items from Stripe
+        const lineItems = await stripe.checkout.sessions.listLineItems(
+            session.id,
+            { expand: ["data.price.product"] }
+        );
+
+        if (!lineItems.data?.length) {
+            throw new Error("No line items found for the checkout session");
+        }
+
+        const orderProduct = lineItems.data.map((item) => {
+            const product = item.price?.product;
+
+            if (!product || typeof product === "string") {
+                throw new Error(
+                    "Stripe product details were not expanded"
                 );
-
-                console.log("🧾 Line items fetched:", lineItems.data.length);
-
-                const userId = session.metadata?.userId;
-                const addressId = session.metadata?.addressId;
-
-                if (!userId || !addressId) {
-                    console.error("❌ Missing metadata (userId or addressId)");
-                    return res.status(400).send("Missing metadata");
-                }
-
-                // 🧩 Build order documents
-                const orderProduct = lineItems.data.map((item) => {
-                    const product = item.price.product;
-                    return {
-                        userId,
-                        orderId: `ORD-${new mongoose.Types.ObjectId()}`,
-                        productId: product.metadata.productId,
-                        product_details: {
-                            name: product.name,
-                            image: product.images,
-                        },
-                        paymentId: session.payment_intent,
-                        payment_status: session.payment_status,
-                        delivery_address: addressId,
-                        subTotalAmt: Number(item.amount_total / 100),
-                        totalAmt: Number(item.amount_total / 100),
-                    };
-                });
-
-                // 💾 Save to MongoDB
-                const order = await OrderModel.insertMany(orderProduct);
-                console.log("🛒 [5] Orders saved:", order.length);
-
-                // 🧹 Clear user's cart
-                await UserModel.findByIdAndUpdate(userId, { shopping_cart: [] });
-                await CartProductModel.deleteMany({ userId });
-                console.log("🧹 [6] User cart cleared!");
-            } catch (err) {
-                console.error("❌ Failed to fetch session line items:", err.message);
-                return res.status(400).send(`Webhook Error: ${err.message}`);
             }
-        }
 
-        res.json({ received: true });
+            const productId = product.metadata?.productId;
+
+            if (!productId) {
+                throw new Error(
+                    `Product ID missing in Stripe metadata for ${product.name}`
+                );
+            }
+
+            return {
+                userId,
+                orderId: `ORD-${new mongoose.Types.ObjectId()}`,
+                productId,
+                product_details: {
+                    name: product.name,
+                    image: product.images || []
+                },
+                paymentId,
+                payment_status: session.payment_status,
+                delivery_address: addressId,
+                subTotalAmt: Number(item.amount_subtotal / 100),
+                totalAmt: Number(item.amount_total / 100)
+            };
+        });
+
+        // Save orders before clearing the cart
+        const savedOrders = await OrderModel.insertMany(orderProduct);
+
+        console.log("Orders saved:", savedOrders.length);
+        console.log("Clearing cart for user:", userId);
+
+        const cartDelete = await CartProductModel.deleteMany({ userId });
+
+        const userUpdate = await UserModel.findByIdAndUpdate(
+            userId,
+            { $set: { shopping_cart: [] } },
+            { new: true }
+        );
+
+        console.log("Cart products deleted:", cartDelete.deletedCount);
+        console.log("User cart updated:", Boolean(userUpdate));
+
+        return res.status(200).json({
+            received: true,
+            message: "Payment processed, orders saved and cart cleared"
+        });
     } catch (error) {
-        console.error("❌ [Webhook Error]:", error.message);
-        res.status(500).json({ error: true, message: error.message });
-    }
-};
+        console.error("Stripe webhook processing error:", error);
 
-export async function getOrderDetailsController(request,response){
-    try {
-        const userId = request.userId // order id
-
-        const orderlist = await OrderModel.find({ userId : userId }).sort({ createdAt : -1 }).populate('delivery_address')
-
-        return response.json({
-            message : "order list",
-            data : orderlist,
-            error : false,
-            success : true
-        })
-    } catch (error) {
-        return response.status(500).json({
-            message : error.message || error,
-            error : true,
-            success : false
-        })
+        // Return a failure so Stripe can retry the webhook.
+        return res.status(500).json({
+            received: false,
+            error: error.message || "Webhook processing failed"
+        });
     }
 }
 
+// ==========================================
+// GET USER ORDERS
+// ==========================================
+export async function getOrderDetailsController(req, res) {
+    try {
+        const userId = req.userId;
 
+        const orderlist = await OrderModel.find({ userId })
+            .sort({ createdAt: -1 })
+            .populate("delivery_address");
 
+        return res.json({
+            message: "Order list",
+            data: orderlist,
+            error: false,
+            success: true
+        });
+    } catch (error) {
+        console.error("Get order details error:", error);
 
+        return res.status(500).json({
+            message: error.message || "Failed to get orders",
+            error: true,
+            success: false
+        });
+    }
+}
